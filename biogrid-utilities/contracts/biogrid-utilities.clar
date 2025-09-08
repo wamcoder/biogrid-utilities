@@ -15,7 +15,7 @@
 (define-constant ERR_RATE_NEGOTIATION_FAILED (err u111))
 (define-constant ERR_MARKETPLACE_TRANSACTION_FAILED (err u112))
 
-;; Contract Owner
+;; Contract Variables
 (define-data-var contract-owner principal tx-sender)
 (define-data-var emergency-protocol-active bool false)
 (define-data-var base-utility-rate uint u100)
@@ -116,6 +116,74 @@
     municipal-reputation: uint
 })
 
+;; Helper Functions
+(define-private (get-current-time)
+    block-height
+)
+
+(define-private (calculate-anomaly-score (consumption-data (list 24 uint)) (baseline-data (list 24 uint)))
+    (let ((variance (fold calculate-variance consumption-data u0)))
+        (if (> variance u50) u90 u10)
+    )
+)
+
+(define-private (calculate-variance (item uint) (acc uint))
+    (+ acc (if (> item u100) u10 u1))
+)
+
+(define-private (calculate-behavioral-discount (behavioral-score uint))
+    (if (>= behavioral-score u90)
+        u20
+        (if (>= behavioral-score u70)
+            u10
+            u0
+        )
+    )
+)
+
+(define-private (calculate-efficiency-bonus (behavioral-score uint))
+    (if (>= behavioral-score u95)
+        u15
+        (if (>= behavioral-score u80)
+            u5
+            u0
+        )
+    )
+)
+
+(define-private (verify-emergency-access (user principal))
+    (let ((permissions (default-to 
+            { electricity: false, water: false, gas: false, internet: false, 
+              waste-management: false, emergency-override: false }
+            (map-get? utility-access-permissions user))))
+        (map-set utility-access-permissions user 
+            (merge permissions { emergency-override: true }))
+        true
+    )
+)
+
+(define-private (update-utility-permissions (user principal) (utility-type (string-ascii 20)))
+    (let ((permissions (default-to 
+            { electricity: false, water: false, gas: false, internet: false, 
+              waste-management: false, emergency-override: false }
+            (map-get? utility-access-permissions user))))
+        (if (is-eq utility-type "electricity")
+            (map-set utility-access-permissions user (merge permissions { electricity: true }))
+            (if (is-eq utility-type "water")
+                (map-set utility-access-permissions user (merge permissions { water: true }))
+                (if (is-eq utility-type "gas")
+                    (map-set utility-access-permissions user (merge permissions { gas: true }))
+                    (if (is-eq utility-type "internet")
+                        (map-set utility-access-permissions user (merge permissions { internet: true }))
+                        (map-set utility-access-permissions user (merge permissions { waste-management: true }))
+                    )
+                )
+            )
+        )
+        true
+    )
+)
+
 ;; Admin Functions
 (define-public (set-contract-owner (new-owner principal))
     (begin
@@ -151,7 +219,7 @@
     (behavioral-score uint)
     (consumption-rhythm (list 24 uint))
     (device-patterns (list 10 uint)))
-    (let ((current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1)))))
+    (let ((current-time (get-current-time)))
         (asserts! (and (>= behavioral-score u1) (<= behavioral-score u100)) ERR_INVALID_BEHAVIORAL_SCORE)
         (asserts! (> (len consumption-rhythm) u0) ERR_INVALID_CONSUMPTION_DATA)
         (map-set user-behavioral-profiles tx-sender {
@@ -191,7 +259,7 @@
             accuracy-score: u100,
             validated-patterns: u0,
             prediction-success-rate: u100,
-            last-validation: (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))),
+            last-validation: (get-current-time),
             validator-status: true
         })
         (ok true)
@@ -224,7 +292,7 @@
         (behavioral-score (get behavioral-score user-profile))
         (base-rate (var-get base-utility-rate))
         (discount (calculate-behavioral-discount behavioral-score))
-        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+        (current-time (get-current-time))
     )
         (asserts! (>= behavioral-score u60) ERR_RATE_NEGOTIATION_FAILED)
         (map-set dynamic-utility-rates tx-sender {
@@ -247,7 +315,6 @@
         (buyer-profile (unwrap! (map-get? user-behavioral-profiles buyer) ERR_UTILITY_ACCESS_DENIED))
         (seller-credits (get energy-credits seller-profile))
         (buyer-tokens (get utility-tokens buyer-profile))
-        (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
     )
         (asserts! (>= seller-credits credits-amount) ERR_INSUFFICIENT_TOKENS)
         (asserts! (>= buyer-tokens asking-price) ERR_INSUFFICIENT_TOKENS)
@@ -269,6 +336,42 @@
     )
 )
 
+(define-public (register-utility-provider 
+    (provider-type (string-ascii 20))
+    (service-area (string-ascii 50))
+    (base-rate uint)
+    (renewable-capacity uint))
+    (begin
+        (map-set utility-providers tx-sender {
+            provider-type: provider-type,
+            service-area: service-area,
+            base-rate: base-rate,
+            renewable-capacity: renewable-capacity,
+            behavioral-compatibility: u100,
+            reputation-score: u100
+        })
+        (ok true)
+    )
+)
+
+(define-public (create-energy-marketplace-offer 
+    (renewable-credits uint)
+    (asking-price uint)
+    (expiry-hours uint))
+    (let ((current-time (get-current-time)))
+        (asserts! (> renewable-credits u0) ERR_INSUFFICIENT_TOKENS)
+        (asserts! (> asking-price u0) ERR_MARKETPLACE_TRANSACTION_FAILED)
+        (map-set energy-marketplace-offers tx-sender {
+            renewable-credits: renewable-credits,
+            asking-price: asking-price,
+            behavioral-verification: true,
+            offer-expiry: (+ current-time (* expiry-hours u3600)),
+            transaction-history: u0
+        })
+        (ok true)
+    )
+)
+
 ;; Read-Only Functions
 (define-read-only (get-behavioral-score (user principal))
     (match (map-get? user-behavioral-profiles user)
@@ -279,4 +382,52 @@
 
 (define-read-only (get-utility-permissions (user principal))
     (match (map-get? utility-access-permissions user)
-        permissions
+        permissions (ok permissions)
+        ERR_UTILITY_ACCESS_DENIED
+    )
+)
+
+(define-read-only (get-validator-info (validator principal))
+    (match (map-get? proof-of-consumption-validators validator)
+        validator-info (ok validator-info)
+        ERR_VALIDATOR_NOT_FOUND
+    )
+)
+
+(define-read-only (get-consumption-analytics (user principal))
+    (match (map-get? consumption-analytics user)
+        analytics (ok analytics)
+        ERR_UTILITY_ACCESS_DENIED
+    )
+)
+
+(define-read-only (get-dynamic-rate (user principal))
+    (match (map-get? dynamic-utility-rates user)
+        rate-info (ok rate-info)
+        ERR_UTILITY_ACCESS_DENIED
+    )
+)
+
+(define-read-only (get-marketplace-offer (seller principal))
+    (match (map-get? energy-marketplace-offers seller)
+        offer-info (ok offer-info)
+        ERR_MARKETPLACE_TRANSACTION_FAILED
+    )
+)
+
+(define-read-only (get-contract-info)
+    (ok {
+        owner: (var-get contract-owner),
+        emergency-active: (var-get emergency-protocol-active),
+        base-rate: (var-get base-utility-rate),
+        fraud-threshold: (var-get fraud-detection-threshold),
+        min-stake: (var-get min-validator-stake)
+    })
+)
+
+(define-read-only (get-user-profile (user principal))
+    (match (map-get? user-behavioral-profiles user)
+        profile (ok profile)
+        ERR_UTILITY_ACCESS_DENIED
+    )
+)
